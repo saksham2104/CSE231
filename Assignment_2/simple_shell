@@ -1,0 +1,310 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <signal.h>
+#include <time.h>
+#include <ctype.h>
+
+#define MAX_HISTORY 100
+#define MAX_CMD_LENGTH 1024
+#define MAX_ARGS 100
+
+// List of supported commands
+char *supported_commands[] = {
+    "ls", "echo", "grep", "wc", "sort", "uniq", "cat", "exit","./fib","./helloworld",
+     "mkdir", "rmdir","history"
+};
+int sz=sizeof(supported_commands)/sizeof(supported_commands[0]);
+
+//  Data-Structure to store command history details
+typedef struct {
+    char *command;
+    pid_t pid;
+    time_t start_time;
+    time_t end_time;
+}
+
+CommandHistory;
+
+// Store command history with details
+CommandHistory history[MAX_HISTORY];
+int history_count = 0;
+
+// Function to add command to history
+void add_history(char *cmd, pid_t pid, time_t start_time) {
+    if (history_count < MAX_HISTORY) {
+       history[history_count].command = malloc(strlen(cmd) + 1);
+        if (history[history_count].command != NULL) {
+            for (int i = 0; cmd[i] != '\0'; i++) {
+                history[history_count].command[i] = cmd[i];
+            }
+            history[history_count].command[strlen(cmd)] = '\0'; // null character termination ('\0')
+        }
+        history[history_count].pid = pid;
+        history[history_count].start_time = start_time;
+        history[history_count].end_time = 0; // Record end time
+        history_count++;
+    }
+}
+
+// Function for updating command end time in history
+void update_history_end_time(pid_t pid) {
+    for (int i = 0; i < history_count; i++) {
+        if (history[i].pid == pid) {
+            history[i].end_time = time(NULL);
+            break;
+        }
+    }
+}
+
+// Function to display command execution details
+void display_execution_details() {
+    printf("\nCommand Execution Details:\n");
+    for (int i = 0; i < history_count; i++) {
+        if (history[i].end_time > 0) { // Only show commands that have completed
+            double duration = difftime(history[i].end_time, history[i].start_time);
+            printf("Command: %s\n", history[i].command);
+            printf("PID: %d\n", history[i].pid);
+            printf("Start Time: %s", ctime(&history[i].start_time));
+            printf("End Time: %s", ctime(&history[i].end_time));
+            printf("Duration: %.2f seconds\n\n", duration);
+        }
+    }
+}
+
+// Function to display command history
+void display_history() {
+    printf("\nCommand History:\n");
+    for (int i = 0; i < history_count; i++) {
+        printf("%d: %s (PID: %d)\n", i + 1, history[i].command, history[i].pid);
+    }
+}
+
+// Function to check if the command is supported
+int is_supported(char *cmd) {
+    for (int i = 0; i < sz; i++) {
+       if (strcmp(cmd, supported_commands[i]) == 0) {
+            return 1;  // Command is supported
+        }
+       
+    }
+    return 0;  // Command not supported
+}
+
+// Function for error handling
+void handle_error(int err_code) {
+    switch (err_code) {
+        case 1:
+            fprintf(stderr, "Child Process could not be created\n");
+            break;
+        case 2:
+            fprintf(stderr, "Command not supported\n");
+            break;
+        case 3:
+            fprintf(stderr, "Error executing command\n");
+            break;
+        default:
+            fprintf(stderr, "An unknown error occurred\n");
+    }
+}
+
+void execute_command(char *command) {
+    char *args[MAX_ARGS];
+    int i = 0;
+
+    // Split command by space
+    char *token = strtok(command, " ");  // First token is the command
+    if (token != NULL) {
+        args[i++] = token; // Store command
+    }
+
+    // Extract the remaining arguments
+    while ((token = strtok(NULL, " ")) != NULL) {
+        args[i++] = token;  // Store each argument
+    }
+
+    args[i] = NULL;  // Null-terminate the argument list
+
+    // Check if the command is supported
+    if (!is_supported(args[0])) {
+        handle_error(2);
+        return;
+    }
+
+    if (execvp(args[0], args) < 0) {
+        handle_error(3);
+        exit(EXIT_FAILURE);
+    }
+}
+
+void handle_single_command(char *command, int background) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        handle_error(1);
+        exit(EXIT_FAILURE);
+    } else if (pid == 0) {
+        //Child process
+        execute_command(command);
+    } 
+    else {
+        //Parent process
+        time_t start_time = time(NULL);
+        add_history(command, pid, start_time);  //Add command to history with PID and start time
+        if (!background) {
+            //If not a background process,wait for child to finish
+            waitpid(pid, NULL, 0);
+            update_history_end_time(pid); // Update end time for the foreground command
+        } else {
+            // Background process, store the PID and do not wait
+            printf("Background process PID: %d\n", pid);
+        }
+    }
+}
+
+// Function to handle multiple commands with pipes
+void handle_pipes(char *commands[], int num_commands) {
+    int fd[2];
+    pid_t pid;
+    int fd_in = 0;
+
+    for (int i = 0; i < num_commands; i++) {
+        pipe(fd);
+        if ((pid = fork()) < 0) {
+            handle_error(1);
+            exit(EXIT_FAILURE);
+        } else if (pid == 0) {
+            // Child process
+            dup2(fd_in, 0); // Change input according to the old one
+            if (i + 1 < num_commands) {
+                dup2(fd[1], 1);  // If not the last command, redirect stdout to pipe
+            }
+            close(fd[0]);
+            execute_command(commands[i]);
+        } else {
+            // Parent process
+            wait(NULL);  // Wait for child process to finish
+            close(fd[1]);
+            fd_in = fd[0]; // Save the input for the next command
+        }
+    }
+}
+
+void handle_sigchld(int sig) {
+    int saved_errno = errno;
+    pid_t pid;
+    int status;
+
+    // Wait for all child processes that have terminated
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        // Only update if the process was a background process.
+        printf(" process %d terminated\n", pid);
+        update_history_end_time(pid); // Update end time for background commands
+    }
+
+    errno = saved_errno;  // Restore errno
+}
+
+
+void cleanup() {
+    for (int i = 0; i < history_count; i++) {
+        free(history[i].command); //free up memory allocated using malloc in add_history function
+    }
+}
+
+// Helper function to trim trailing whitespace
+void trim_trailing_whitespace(char *str) {
+    size_t len = strlen(str);
+    while (len > 0 && isspace(str[len - 1])) {
+        str[--len] = '\0'; // Replace trailing whitespace with null terminator
+    }
+}
+
+int main() {
+    char command[MAX_CMD_LENGTH];
+    char *parsed_commands[MAX_ARGS];
+    int num_commands;
+    int background;
+
+    // Set up the signal handler for SIGCHLD
+    struct sigaction sa;
+    sa.sa_handler = &handle_sigchld;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP; // Restart and ignore stopped children
+    if (sigaction(SIGCHLD, &sa, 0) == -1) {
+        handle_error(1);
+        exit(EXIT_FAILURE);
+    }
+    
+    printf("These are the supported commands ");
+    for(int i=0;i<sz;i++){
+        printf("%s  ",supported_commands[i]);
+        if(i==sz-1){
+            printf("\n");
+        }
+    }
+
+    while (1) {
+        // Display the prompt
+        printf("SimpleShell> ");
+        
+        
+        // Read user input
+        if (!fgets(command, MAX_CMD_LENGTH, stdin)) {
+            break; // Exit on EOF
+        }
+
+        // Remove newline character from command
+        command[strcspn(command, "\n")] = 0;
+
+        // Trim trailing whitespace
+        trim_trailing_whitespace(command);
+
+        // Check if command is empty
+        if (strlen(command) == 0) {
+            continue;
+        }
+
+        // Check if the command is 'exit' directly
+        if (strcmp(command, "exit") == 0) {
+            display_execution_details(); // Display execution details before exiting
+            cleanup(); // Clean up allocated memory
+            exit(0); // Ensure the exit is called immediately
+        }
+
+        // Check if the command is 'history'
+        if (strcmp(command, "history") == 0) {
+            display_history();
+            continue;
+        }
+
+        // Check if the command is a background command
+        background = 0;
+        if (command[strlen(command) - 1] == '&') {
+            background = 1;
+            command[strlen(command) - 1] = 0; // Remove '&' from command
+            trim_trailing_whitespace(command); // Trim again to remove any trailing spaces after removing '&'
+        }
+
+        // Split the command for pipes
+        num_commands = 0;
+        char *token = strtok(command, "|");
+        while (token != NULL) {
+            parsed_commands[num_commands++] = token;
+            token = strtok(NULL, "|");
+        }
+        
+        // Execute commands with pipes or single command
+        if (num_commands > 1) {
+            handle_pipes(parsed_commands, num_commands);
+        } else {
+            handle_single_command(command, background);
+        }
+    }
+
+    cleanup();
+    return 0;
+}
+
